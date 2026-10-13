@@ -1,8 +1,8 @@
 [package]
 name = "gpad-daemon"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
-description = "Daemon PC Gpad: terima paket pena via USB/ADB, suntikkan sebagai input ke OS"
+description = "Daemon PC Gpad v0.5.0 Cintiq mode: mirror layar via AOA USB + input pena"
 license = "MIT"
 
 [[bin]]
@@ -13,8 +13,11 @@ path = "src/main.rs"
 gpad-protocol = { path = "../gpad-protocol" }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.8" }
+rusb = "0.9"
 
-# API injection Windows hanya dikompilasi di Windows.
+# API Windows hanya dikompilasi di Windows.
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_UI_Input_Pointer", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_UI_Controls", "Win32_Graphics_Gdi", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse"] }
+windows = { version = "0.58", features = ["Win32_UI_Input_Pointer", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_UI_Controls", "Win32_Graphics_Gdi", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Console"] }
 tray-icon = "0.20"
+dxgcap = "0.2"
+openh264 = "0.7"

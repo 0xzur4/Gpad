@@ -1,43 +1,9 @@
-# gpad.example.toml — salin menjadi gpad.toml di folder yang sama dengan exe.
-# Semua bagian opsional; yang tidak ditulis memakai default.
+# Contoh gpad.toml (v0.5.0) — taruh di folder yang sama dengan gpad-daemon.exe
+# atau %APPDATA%\Gpad\gpad.toml. Semua opsional; default di bawah.
 
-[general]
-# Mode awal: "absolute" atau "relative"
-mode = "absolute"
-
-[absolute]
-# Area pemetaan: "screen" (seluruh virtual screen) | "monitor:0" | "custom"
-area = "screen"
-# Jika area = "custom": persegi dalam piksel virtual screen
-# x = 100
-# y = 100
-# w = 1600
-# h = 900
-# Kunci rasio aspek HP agar lingkaran tidak jadi elips
-keep_aspect = true
-
-[relative]
-# Pengali gerak (1.0 = geser penuh HP = selebar area)
-sensitivity = 1.0
+[video]
+fps = 30            # 1..60, target frame per detik mirror
+bitrate_kbps = 3000 # 500..8000, kualitas vs beban USB
 
 [pressure]
-# Kurva tekanan; env GPAD_PRESSURE_GAMMA menimpa nilai ini
-gamma = 1.0
-
-[switching]
-# Tombol barrel saat sentuh = ganti mode
-barrel_toggles_mode = true
-# Pintasan global ganti mode ("" = mati)
-hotkey = "ctrl+alt+g"
-
-# Profil per aplikasi: diterapkan saat jendela foreground berganti.
-# Hanya field yang ditulis yang dioverride.
-[profile.photoshop]
-process = "photoshop.exe"
-mode = "absolute"
-
-[profile.krita]
-process = "krita.exe"
-mode = "absolute"
-sensitivity = 1.2
-gamma = 1.4
+gamma = 1.0         # kurva tekanan; env GPAD_PRESSURE_GAMMA menimpa

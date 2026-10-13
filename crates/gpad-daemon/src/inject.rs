@@ -25,6 +25,7 @@ pub struct PenReport {
 ///
 /// Sengaja TANPA bound Send: handle Windows (HSYNTHETICPOINTERDEVICE)
 /// berisi raw pointer dan hanya dipakai dari satu thread per koneksi.
+#[allow(dead_code)] // screen_size/cursor_pos: API publik untuk sesi mendatang
 pub trait Injector {
     /// Suntikkan satu laporan pena.
     fn pen(&mut self, r: &PenReport);
@@ -62,6 +63,7 @@ pub mod win {
 
     pub struct WinInjector {
         device: HSYNTHETICPOINTERDEVICE,
+        #[allow(dead_code)]
         display_rect: RECT,
         frame_id: u32,
         was_contact: bool,

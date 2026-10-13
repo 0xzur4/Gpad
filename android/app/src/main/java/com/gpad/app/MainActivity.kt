@@ -1,9 +1,15 @@
 package com.gpad.app
 
 import android.app.Activity
+import android.content.Context
+import android.content.Intent
 import android.graphics.Color
+import android.hardware.usb.UsbAccessory
+import android.hardware.usb.UsbManager
 import android.os.Bundle
 import android.view.Gravity
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
@@ -11,46 +17,42 @@ import android.widget.FrameLayout
 import android.widget.TextView
 
 /**
- * Gpad Fase 1: kanvas sentuh fullscreen + indikator status koneksi.
+ * Gpad v0.5.0 "Cintiq mode".
+ *
+ * - HP jadi pen display: layar PC di-mirror via USB accessory (TANPA ADB).
+ * - Satu tombol "Hubungkan"; status + fps tampil di atas.
+ * - Gambar di HP sambil melihat layar HP; PC juga menampilkannya.
  *
  * Cara pakai:
- *  1. Di PC (Windows): jalankan gpad-daemon.exe
- *  2. Colok HP via kabel USB DATA, aktifkan USB debugging
- *  3. Di PC: adb reverse tcp:51337 tcp:51337
- *     (atau biarkan daemon mencoba otomatis)
- *  4. Buka aplikasi ini — status berubah "Tersambung", kursor PC mengikuti jari/stylus
+ *  1. Di PC: jalankan gpad-daemon.exe (satu kali setup driver WinUSB
+ *     via Zadig — lihat docs/driver-setup.md).
+ *  2. Colok HP dengan kabel USB DATA.
+ *  3. Buka aplikasi ini, tap "Hubungkan".
  */
 class MainActivity : Activity() {
 
-    private lateinit var net: NetClient
+    private lateinit var usbManager: UsbManager
+    private var link: UsbLink? = null
+    private var decoder: VideoDecoder? = null
+
     private lateinit var statusView: TextView
-    private lateinit var penView: PenView
-    private lateinit var modeButton: Button
-    private var wantRelative = false
+    private lateinit var connectButton: Button
+    private lateinit var surfaceView: SurfaceView
+    private lateinit var touchView: TouchView
+
+    private var pendingAccessory: UsbAccessory? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        @Suppress("DEPRECATION")
-        window.decorView.systemUiVisibility =
-            android.view.View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
-            android.view.View.SYSTEM_UI_FLAG_FULLSCREEN or
-            android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
 
-        net = NetClient(
-            onStatus = { msg -> runOnUiThread { statusView.text = msg } },
-            onMode = { mode ->
-                runOnUiThread {
-                    wantRelative = (mode == NetClient.MODE_RELATIVE)
-                    refreshModeButton()
-                }
-            },
-        )
+        usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
 
-        penView = PenView(this).also { it.net = net }
+        surfaceView = SurfaceView(this)
+        touchView = TouchView(this)
 
         statusView = TextView(this).apply {
-            text = "Menghubungkan…"
+            text = "Colok USB, lalu tap Hubungkan"
             setTextColor(Color.WHITE)
             textSize = 14f
             gravity = Gravity.CENTER
@@ -58,18 +60,20 @@ class MainActivity : Activity() {
             setPadding(24, 16, 24, 16)
         }
 
-        modeButton = Button(this).apply {
-            textSize = 14f
-            setOnClickListener {
-                wantRelative = !wantRelative
-                net.sendModeSwitch(wantRelative)
-                refreshModeButton()
-            }
+        connectButton = Button(this).apply {
+            text = "Hubungkan"
+            textSize = 18f
+            setOnClickListener { onConnectButton() }
         }
-        refreshModeButton()
 
         val root = FrameLayout(this).apply {
-            addView(penView, FrameLayout.LayoutParams(
+            setBackgroundColor(Color.BLACK)
+            addView(surfaceView, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ))
+            // Lapisan sentuh transparan di atas video.
+            addView(touchView, FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
             ))
@@ -78,26 +82,108 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.CENTER_HORIZONTAL,
             ).apply { topMargin = 48 })
-            addView(modeButton, FrameLayout.LayoutParams(
+            addView(connectButton, FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.BOTTOM or Gravity.END,
-            ).apply { bottomMargin = 48; rightMargin = 48 })
+                Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL,
+            ).apply { bottomMargin = 64 })
         }
         setContentView(root)
+
+        surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                // Decoder dibuat saat koneksi (butuh surface yang valid).
+            }
+            override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, h2: Int) {}
+            override fun surfaceDestroyed(h: SurfaceHolder) {
+                decoder?.stop()
+                decoder = null
+            }
+        })
+
+        // Dibuka via USB_ACCESSORY_ATTACHED?
+        if (intent?.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED) {
+            @Suppress("DEPRECATION")
+            pendingAccessory = intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY)
+            setStatus("Accessory terdeteksi — tap Hubungkan")
+        }
     }
 
-    private fun refreshModeButton() {
-        modeButton.text = if (wantRelative) "RELATIF" else "ABSOLUT"
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (intent.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED) {
+            @Suppress("DEPRECATION")
+            pendingAccessory = intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY)
+            setStatus("Accessory terdeteksi — tap Hubungkan")
+        }
     }
 
-    override fun onResume() {
-        super.onResume()
-        net.start()
+    private fun onConnectButton() {
+        if (link?.isConnected == true) {
+            disconnect()
+            return
+        }
+        val accessory = pendingAccessory
+            ?: usbManager.accessoryList?.firstOrNull()
+        if (accessory == null) {
+            setStatus("Accessory tidak ditemukan — colok USB & jalankan daemon dulu")
+            return
+        }
+        connect(accessory)
+    }
+
+    private fun connect(accessory: UsbAccessory) {
+        setStatus("Menghubungkan…")
+        connectButton.isEnabled = false
+
+        val surface = surfaceView.holder.surface
+        val dec = VideoDecoder(surface) { err ->
+            runOnUiThread { setStatus(err) }
+        }
+        decoder = dec
+
+        val newLink = UsbLink(
+            manager = usbManager,
+            onStatus = { msg -> runOnUiThread { setStatus(msg) } },
+            onVideo = { payload -> dec.feed(payload) },
+            onStats = { fps, rtt -> runOnUiThread { setStatus("Tersambung — $fps fps, RTT ${rtt}ms") } },
+            onReply = { reply ->
+                runOnUiThread {
+                    touchView.videoAspect =
+                        if (reply.vidH > 0) reply.vidW.toFloat() / reply.vidH else 0f
+                    connectButton.text = "Putuskan"
+                    connectButton.isEnabled = true
+                }
+            },
+        )
+        link = newLink
+        dec.start()
+        val dm = resources.displayMetrics
+        newLink.start(accessory, dm.widthPixels, dm.heightPixels)
+    }
+
+    private fun disconnect() {
+        link?.stop()
+        link = null
+        decoder?.stop()
+        decoder = null
+        connectButton.text = "Hubungkan"
+        connectButton.isEnabled = true
+        setStatus("Terputus")
+    }
+
+    private fun setStatus(msg: String) {
+        statusView.text = msg
     }
 
     override fun onPause() {
-        net.stop()
+        // Jangan putus saat screen-off sesaat? v0.5.0: putus agar hemat.
+        // (Pengguna tap Hubungkan lagi.)
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        disconnect()
+        super.onDestroy()
     }
 }

@@ -1,487 +1,425 @@
-//! gpad-daemon — Fase 3 (kenyamanan pakai).
+//! gpad-daemon v0.5.0 "Cintiq mode".
 //!
-//! - Mode absolut (area: layar / monitor:N / custom, opsi keep_aspect)
-//!   dan mode relatif (sensitivitas, tanpa akselerasi).
-//! - Ganti mode: tombol di HP, tombol barrel stylus, hotkey global,
-//!   menu tray. Daemon -> HP: paket balasan mode ("GMOD").
-//! - Konfigurasi TOML (gpad.toml) + profil per aplikasi (Windows).
-//! - Pen injection Windows Ink seperti Fase 2.
+//! Arsitektur: HP sebagai pen display.
+//! - Transport: Android Open Accessory (AOA) over USB bulk (rusb).
+//!   TANPA ADB, TANPA `adb reverse`, TANPA TCP.
+//! - Video downstream: DXGI -> scale ≤1080p -> OpenH264 -> USB ->
+//!   MediaCodec di HP. 30 fps target.
+//! - Input upstream: sentuh HP -> koordinat desktop 0.0..1.0 ->
+//!   Windows Ink synthetic pointer (dipakai ulang dari v0.4.x).
+//! - Heartbeat 1 detik dua arah + echo RTT; putus >3.5 detik ->
+//!   reconnect dengan backoff eksponensial.
+//!
+//! Tanpa console secara default (tray app); `--console` untuk diagnostik.
+//!
+//! Loop sesi single-threaded (sengaja): DXGI handle & tray icon bukan Send,
+//! dan multiplexing I/O USB memang paling sederhana dalam satu loop.
+
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod config;
-#[cfg(windows)]
-mod foreground;
-#[cfg(windows)]
-mod hotkey;
 mod inject;
-mod mapping;
+mod usb;
+mod vidutil;
 #[cfg(windows)]
 mod tray;
+#[cfg(windows)]
+mod video;
 
 use config::Config;
 use gpad_protocol::{
-    encode_mode_reply, Handshake, PenPacket, FLAG_BARREL_BUTTON, FLAG_ERASER, GPAD_PORT,
-    HANDSHAKE_LEN, KIND_DOWN, KIND_HOVER, KIND_MODE_SWITCH, KIND_MOVE, KIND_UP, MODE_ABSOLUTE,
-    MODE_RELATIVE, PACKET_LEN, PROTOCOL_VERSION,
+    decode_heartbeat, encode_heartbeat, Handshake, HandshakeReply, PenPacket, Stats, CH_CONTROL,
+    CH_HEARTBEAT, CH_INPUT, CH_STATS, CH_VIDEO, HANDSHAKE_LEN, PACKET_LEN, PROTOCOL_VERSION,
+    KIND_DOWN, KIND_HOVER, KIND_MOVE, KIND_UP,
 };
 use inject::{Injector, PenReport};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU16, AtomicU8, Ordering};
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use inject::win::WinInjector;
 #[cfg(not(windows))]
 use inject::mock::MockInjector;
 
-/// Mode aktif bersama: ditulis oleh hotkey/tray/HP/barrel/profil, dibaca per paket.
-static MODE: AtomicU8 = AtomicU8::new(MODE_ABSOLUTE);
-/// Override sensitivitas profil (bits f32; 0 = pakai config).
-static SENS_OVERRIDE: AtomicU32 = AtomicU32::new(0);
-/// Override gamma profil (bits f32; 0 = pakai config).
-static GAMMA_OVERRIDE: AtomicU32 = AtomicU32::new(0);
+/// Status koneksi global untuk tray: 0=idle, 1=menghubungkan, 2=terhubung.
+static STATUS: AtomicU8 = AtomicU8::new(0);
+static FPS_OUT: AtomicU8 = AtomicU8::new(0);
+static RTT_MS: AtomicU16 = AtomicU16::new(0);
 
-fn mode_name(m: u8) -> &'static str {
-    if m == MODE_ABSOLUTE {
-        "absolut"
-    } else {
-        "relatif"
-    }
-}
+const HB_INTERVAL: Duration = Duration::from_secs(1);
+/// Bila echo heartbeat tak kembali dalam ini, anggap mati.
+const HB_DEAD_AFTER: Duration = Duration::from_millis(3500);
+/// Timeout poll baca USB per iterasi loop (tetap responsif untuk video).
+const POLL_TIMEOUT: Duration = Duration::from_millis(10);
 
 fn main() {
-    println!(
-        "Gpad daemon v{} — Fase 3 (mode absolut/relatif, tray, profil)",
+    #[allow(unused_variables)]
+    let want_console = std::env::args().any(|a| a == "--console");
+    #[cfg(windows)]
+    if want_console {
+        use windows::Win32::System::Console::AllocConsole;
+        unsafe {
+            let _ = AllocConsole();
+        }
+    }
+    eprintln!(
+        "Gpad daemon v{} — Cintiq mode (AOA USB, mirror + pen)",
         env!("CARGO_PKG_VERSION")
     );
     let config = Config::load();
-    MODE.store(
-        if config.general.mode == "relative" {
-            MODE_RELATIVE
-        } else {
-            MODE_ABSOLUTE
-        },
-        Ordering::Relaxed,
-    );
-    eprintln!("mode awal: {}", mode_name(MODE.load(Ordering::Relaxed)));
-
-    try_adb_reverse();
 
     #[cfg(windows)]
-    {
-        let hk = config.switching.hotkey.clone();
-        if !hk.trim().is_empty() {
-            std::thread::Builder::new()
-                .name("gpad-hotkey".into())
-                .spawn(move || hotkey::run(&hk))
-                .expect("spawn hotkey");
-        }
-        std::thread::Builder::new()
-            .name("gpad-tray".into())
-            .spawn(tray::run)
-            .expect("spawn tray");
-        let profiles: Vec<config::Profile> = config.profile.values().cloned().collect();
-        if !profiles.is_empty() {
-            std::thread::Builder::new()
-                .name("gpad-profiles".into())
-                .spawn(move || foreground::run(profiles))
-                .expect("spawn profiles");
-        }
-    }
+    std::thread::Builder::new()
+        .name("gpad-tray".into())
+        .spawn(tray::run)
+        .expect("spawn tray");
 
-    let addr = format!("127.0.0.1:{GPAD_PORT}");
-    let listener = TcpListener::bind(&addr).expect("gagal bind localhost");
-    println!("Mendengarkan di {addr} (hanya localhost).");
+    session_loop(&config);
+}
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
-                println!("Perangkat tersambung.");
-                handle_client(s, &config);
-                println!("Perangkat terputus — menunggu koneksi berikutnya.");
+/// Loop abadi: sambung -> sesi -> putus -> backoff -> sambung lagi.
+fn session_loop(config: &Config) {
+    let mut attempt = 0u32;
+    loop {
+        STATUS.store(1, Ordering::Relaxed);
+        match usb::connect() {
+            Ok(link) => {
+                eprintln!("USB tersambung.");
+                attempt = 0;
+                run_session(link, config);
+                eprintln!("sesi berakhir — reconnect…");
             }
-            Err(e) => eprintln!("accept gagal: {e}"),
+            Err(e) => {
+                eprintln!("sambung gagal: {e}");
+            }
         }
+        STATUS.store(0, Ordering::Relaxed);
+        FPS_OUT.store(0, Ordering::Relaxed);
+        let d = gpad_protocol::reconnect_delay(attempt);
+        attempt = attempt.saturating_add(1);
+        eprintln!("coba lagi dalam {}s…", d.as_secs());
+        std::thread::sleep(d);
     }
 }
 
-/// Diagnostik ADB: reverse + cek status perangkat (kabel/otorisasi).
-fn try_adb_reverse() {
-    let arg = format!("tcp:{GPAD_PORT}");
-    let rev = std::process::Command::new("adb")
-        .args(["reverse", &arg, &arg])
-        .output();
-    match rev {
-        Ok(o) if o.status.success() => {
-            println!("adb reverse aktif.");
-            // Cek daftar perangkat untuk panduan koneksi.
-            if let Ok(dev) = std::process::Command::new("adb").arg("devices").output() {
-                let out = String::from_utf8_lossy(&dev.stdout);
-                let lines: Vec<&str> = out.lines().skip(1).filter(|l| !l.trim().is_empty()).collect();
-                if lines.is_empty() {
-                    println!("panduan: tidak ada perangkat — cek KABEL DATA (bukan charge-only) dan USB debugging.");
-                } else if lines.iter().any(|l| l.contains("unauthorized")) {
-                    println!("panduan: perangkat belum dipercaya — setujui dialog RSA di HP.");
-                } else {
-                    println!("panduan: {} perangkat terdeteksi.", lines.len());
-                }
-            }
-        }
-        _ => println!(
-            "adb tidak jalan — instal platform-tools lalu: adb reverse tcp:{GPAD_PORT} tcp:{GPAD_PORT}"
-        ),
-    }
-}
-
-fn handle_client(stream: TcpStream, config: &Config) {
-    if let Err(e) = stream.set_nodelay(true) {
-        eprintln!("set_nodelay gagal: {e}");
-        return;
-    }
-    // Fase 4: pembacaan BLOKIR tanpa timeout — tidak ada bangun palsu tiap
-    // 30 detik; putus koneksi terdeteksi dari penutupan socket oleh HP.
-
-    #[cfg(windows)]
-    let injector = WinInjector::new();
-    #[cfg(not(windows))]
-    let injector = MockInjector::with_screen(1920, 1080);
-
-    // --- handshake ---
-    let peer = stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "?".into());
-    let mut hb = [0u8; HANDSHAKE_LEN];
-    let mut stream = stream;
-    if let Err(e) = stream.read_exact(&mut hb) {
-        eprintln!("gagal baca handshake dari {peer}: {e}");
-        return;
-    }
-    let phone_aspect = match Handshake::decode(&hb) {
-        Some(h) if h.version == PROTOCOL_VERSION => {
-            println!(
-                "Handshake OK: protokol v{}, layar HP {}x{}, caps=0x{:04x}",
-                h.version, h.width, h.height, h.caps
-            );
-            if h.height > 0 {
-                h.width as f32 / h.height as f32
-            } else {
-                0.0
-            }
-        }
-        Some(h) => {
-            eprintln!("versi protokol tak cocok: {}", h.version);
-            return;
-        }
-        None => {
-            eprintln!("magic handshake salah — bukan klien Gpad?");
+/// Satu sesi: handshake, lalu loop I/O sampai fatal.
+fn run_session(mut link: usb::UsbLink, config: &Config) {
+    // --- handshake: HP mengirim duluan ---
+    let (ch, payload) = match read_frame_deadline(&mut link, Duration::from_secs(10)) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("handshake gagal dibaca: {e}");
             return;
         }
     };
+    if ch != CH_CONTROL || payload.len() != HANDSHAKE_LEN {
+        eprintln!("handshake: channel/panjang salah (ch={ch} len={})", payload.len());
+        return;
+    }
+    let mut hb = [0u8; HANDSHAKE_LEN];
+    hb.copy_from_slice(&payload);
+    let hs = match Handshake::decode(&hb) {
+        Some(h) if h.version == PROTOCOL_VERSION => h,
+        Some(h) => {
+            eprintln!("versi protokol HP tak cocok: {}", h.version);
+            return;
+        }
+        None => {
+            eprintln!("magic handshake salah");
+            return;
+        }
+    };
+    eprintln!("Handshake OK: HP {}x{} caps=0x{:04x}", hs.width, hs.height, hs.caps);
 
-    let reply = stream.try_clone().ok();
-    let mut app = App::new(injector, config.clone(), phone_aspect, reply);
-    let mut stats = ProcStats::new();
+    #[cfg(windows)]
+    let (desk_w, desk_h) = desktop_size();
+    #[cfg(not(windows))]
+    let (desk_w, desk_h) = (1920, 1080);
 
-    let mut pb = [0u8; PACKET_LEN];
+    #[cfg(windows)]
+    let mut pipeline = match video::VideoPipeline::new(
+        desk_w as usize,
+        desk_h as usize,
+        config.bitrate_bps(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return;
+        }
+    };
+    #[cfg(windows)]
+    let (vid_w, vid_h) = pipeline.enc_size();
+    #[cfg(not(windows))]
+    let (vid_w, vid_h) = (1280, 720);
+
+    let reply = HandshakeReply {
+        version: PROTOCOL_VERSION,
+        desk_w: desk_w.min(65535) as u16,
+        desk_h: desk_h.min(65535) as u16,
+        vid_w: vid_w.min(65535) as u16,
+        vid_h: vid_h.min(65535) as u16,
+        fps: config.video.fps.min(255) as u8,
+    };
+    if link.write_frame(CH_CONTROL, &reply.encode()).is_err() {
+        eprintln!("gagal kirim balasan handshake");
+        return;
+    }
+
+    #[cfg(windows)]
+    let mut injector = WinInjector::new();
+    #[cfg(not(windows))]
+    let mut injector = MockInjector::with_screen(desk_w as i32, desk_h as i32);
+    let gamma = config.gamma();
+
+    STATUS.store(2, Ordering::Relaxed);
+
+    let video_interval = Duration::from_secs_f64(1.0 / config.fps().max(1).min(60) as f64);
+    let mut next_video = Instant::now();
+    let mut next_hb = Instant::now();
+    let mut next_stats = Instant::now();
+    let mut pending_hb: Option<u64> = None;
+    let mut last_hb_echo = Instant::now();
+    let mut last_seq: Option<u16> = None;
+    let mut frames_sent = 0u64;
+    let mut bytes_sent = 0u64;
+    let mut stat_window = Instant::now();
+
     loop {
-        if stream.read_exact(&mut pb).is_err() {
-            break;
-        }
-        // Fase 4: ukur waktu proses daemon per paket (decode + mapping + inject).
-        let t0 = Instant::now();
-        let pkt = PenPacket::decode(&pb);
-        app.on_packet(&pkt);
-        stats.record(t0.elapsed());
-    }
-}
+        let now = Instant::now();
 
-/// Fase 4: statistik latensi pemrosesan daemon per paket.
-/// Dilaporkan tiap 2000 paket: rata-rata, p95, maks (mikrodetik).
-/// Ini komponen "jeda proses daemon" — di Windows mencakup InjectSyntheticPointerInput.
-struct ProcStats {
-    durs: Vec<std::time::Duration>,
-}
-
-impl ProcStats {
-    fn new() -> Self {
-        Self { durs: Vec::with_capacity(2000) }
-    }
-
-    fn record(&mut self, d: std::time::Duration) {
-        self.durs.push(d);
-        if self.durs.len() >= 2000 {
-            self.durs.sort_unstable();
-            let n = self.durs.len();
-            let sum: std::time::Duration = self.durs.iter().sum();
-            let avg = sum / n as u32;
-            let p95 = self.durs[((n as f64 * 0.95) as usize).min(n - 1)];
-            let max = self.durs[n - 1];
-            eprintln!(
-                "latensi proses daemon (n={n}): avg={}us p95={}us max={}us",
-                avg.as_micros(),
-                p95.as_micros(),
-                max.as_micros()
-            );
-            self.durs.clear();
-        }
-    }
-}
-
-/// Keadaan per koneksi.
-struct App<I: Injector> {
-    injector: I,
-    config: Config,
-    phone_aspect: f32,
-    area: mapping::Area,
-    relative: Option<mapping::RelativeState>,
-    last_seq: Option<u16>,
-    down: bool,
-    last_mode: u8,
-    last_replied: Option<u8>,
-    reply: Option<TcpStream>,
-}
-
-impl<I: Injector> App<I> {
-    fn new(injector: I, config: Config, phone_aspect: f32, reply: Option<TcpStream>) -> Self {
-        let (sw, sh) = injector.screen_size();
-        let area = mapping::resolve_area(
-            &config.absolute.area,
-            sw,
-            sh,
-            (
-                config.absolute.x,
-                config.absolute.y,
-                config.absolute.w,
-                config.absolute.h,
-            ),
-        );
-        println!(
-            "area absolut: {}x{}+{}+{} (keep_aspect={})",
-            area.w, area.h, area.x, area.y, config.absolute.keep_aspect
-        );
-        let mode = MODE.load(Ordering::Relaxed);
-        Self {
-            injector,
-            config,
-            phone_aspect,
-            area,
-            relative: None,
-            last_seq: None,
-            down: false,
-            last_mode: mode,
-            last_replied: None,
-            reply,
-        }
-    }
-
-    fn sensitivity(&self) -> f32 {
-        let bits = SENS_OVERRIDE.load(Ordering::Relaxed);
-        if bits != 0 {
-            f32::from_bits(bits)
-        } else {
-            self.config.relative.sensitivity
-        }
-        .clamp(0.1, 5.0)
-    }
-
-    fn gamma(&self) -> f32 {
-        let bits = GAMMA_OVERRIDE.load(Ordering::Relaxed);
-        if bits != 0 {
-            f32::from_bits(bits).clamp(0.25, 4.0)
-        } else {
-            self.config.gamma()
-        }
-    }
-
-    /// Kirim balasan mode ke HP jika berubah.
-    fn maybe_send_mode(&mut self) {
-        let m = MODE.load(Ordering::Relaxed);
-        if self.last_replied == Some(m) {
-            return;
-        }
-        if let Some(w) = self.reply.as_mut() {
-            let _ = w.write_all(&encode_mode_reply(m));
-        }
-        self.last_replied = Some(m);
-    }
-
-    fn on_packet(&mut self, p: &PenPacket) {
-        if let Some(prev) = self.last_seq {
-            let gap = p.seq_gap(prev);
-            if gap > 0 {
-                eprintln!("peringatan: {gap} paket hilang (seq {prev} -> {})", p.seq);
-            }
-        }
-        self.last_seq = Some(p.seq);
-
-        // --- ganti mode eksplisit dari HP ---
-        if p.kind == KIND_MODE_SWITCH {
-            let m = if p.flags & 1 == 1 { MODE_RELATIVE } else { MODE_ABSOLUTE };
-            MODE.store(m, Ordering::Relaxed);
-            eprintln!("mode -> {} (via HP)", mode_name(m));
-            self.maybe_send_mode();
-            return;
-        }
-
-        // --- baca mode terkini (bisa diubah hotkey/tray/barrel/profil) ---
-        let mode = MODE.load(Ordering::Relaxed);
-        if mode != self.last_mode {
-            eprintln!("mode -> {}", mode_name(mode));
-            self.last_mode = mode;
-            if mode == MODE_RELATIVE {
-                let (cx, cy) = self.injector.cursor_pos();
-                self.relative = Some(mapping::RelativeState::new(cx, cy, self.area));
-            } else {
-                self.relative = None;
-            }
-        }
-        self.maybe_send_mode();
-
-        // --- hitung posisi piksel sesuai mode ---
-        let (x, y) = if mode == MODE_RELATIVE {
-            if self.relative.is_none() {
-                let (cx, cy) = self.injector.cursor_pos();
-                self.relative = Some(mapping::RelativeState::new(cx, cy, self.area));
-            }
-            let sens = self.sensitivity();
-            let rel = self.relative.as_mut().expect("baru dibuat");
-            let is_down = p.kind == KIND_DOWN;
-            let is_up = p.kind == KIND_UP;
-            if is_down {
-                self.down = true;
-            }
-            let pos = rel.event(is_down, is_up, p.x, p.y, sens);
-            if is_up {
-                self.down = false;
-            }
-            pos
-        } else {
-            mapping::absolute(
-                p.x,
-                p.y,
-                self.area,
-                self.config.absolute.keep_aspect,
-                self.phone_aspect,
-            )
-        };
-
-        let contact = match p.kind {
-            KIND_DOWN => {
-                self.down = true;
-                // Tombol barrel saat DOWN = ganti mode (Fase 3).
-                if self.config.switching.barrel_toggles_mode && p.flags & FLAG_BARREL_BUTTON != 0
-                {
-                    let cur = MODE.load(Ordering::Relaxed);
-                    let next = if cur == MODE_ABSOLUTE { MODE_RELATIVE } else { MODE_ABSOLUTE };
-                    MODE.store(next, Ordering::Relaxed);
-                    eprintln!("mode -> {} (via barrel)", mode_name(next));
+        // 1. Video (Windows): pump bila jadwalnya tiba.
+        #[cfg(windows)]
+        if now >= next_video {
+            next_video = now + video_interval;
+            match pipeline.pump() {
+                Ok(Some(payload)) => {
+                    if link.write_frame(CH_VIDEO, &payload).is_err() {
+                        eprintln!("tulis video gagal — koneksi putus");
+                        return;
+                    }
+                    frames_sent += 1;
+                    bytes_sent += payload.len() as u64;
                 }
-                true
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("video error: {e}");
+                    return;
+                }
             }
-            KIND_MOVE => self.down,
-            KIND_UP | KIND_HOVER => {
-                self.down = false;
-                false
-            }
-            k => {
-                eprintln!("kind tak dikenal: {k}");
+        }
+
+        // 2. Heartbeat tiap detik.
+        if now >= next_hb {
+            next_hb = now + HB_INTERVAL;
+            let ts = monotonic_us();
+            if link.write_frame(CH_HEARTBEAT, &encode_heartbeat(ts)).is_err() {
+                eprintln!("tulis heartbeat gagal");
                 return;
             }
-        };
+            pending_hb = Some(ts);
+        }
 
-        self.injector.pen(&PenReport {
-            x,
-            y,
-            pressure01: (p.pressure.clamp(0.0, 1.0).powf(self.gamma())),
-            tilt_x: p.tilt_x as i32,
-            tilt_y: p.tilt_y as i32,
-            in_range: true,
-            contact,
-            barrel: p.flags & FLAG_BARREL_BUTTON != 0,
-            eraser: p.flags & FLAG_ERASER != 0,
-        });
+        // 3. Stats tiap detik.
+        if now >= next_stats {
+            next_stats = now + Duration::from_secs(1);
+            let el = stat_window.elapsed().as_secs_f64().max(0.001);
+            let fps = (frames_sent as f64 / el).round().clamp(0.0, 255.0) as u8;
+            let kbps = (bytes_sent as f64 * 8.0 / el / 1000.0).round().clamp(0.0, 65535.0) as u16;
+            FPS_OUT.store(fps, Ordering::Relaxed);
+            let stats = Stats {
+                fps,
+                rtt_ms: RTT_MS.load(Ordering::Relaxed),
+                bitrate_kbps: kbps,
+            };
+            if link.write_frame(CH_STATS, &stats.encode()).is_err() {
+                eprintln!("tulis stats gagal");
+                return;
+            }
+            frames_sent = 0;
+            bytes_sent = 0;
+            stat_window = Instant::now();
+        }
+
+        // 4. Mati bila echo tak kembali.
+        if pending_hb.is_some() && now.duration_since(last_hb_echo) > HB_DEAD_AFTER {
+            eprintln!("heartbeat tak di-echo >3.5s — koneksi mati");
+            return;
+        }
+
+        // 5. Baca input/heartbeat (poll singkat agar loop tetap jalan).
+        match link.poll_frame(POLL_TIMEOUT) {
+            Ok(Some((CH_INPUT, payload))) => {
+                if payload.len() == PACKET_LEN {
+                    let mut b = [0u8; PACKET_LEN];
+                    b.copy_from_slice(&payload);
+                    let pkt = PenPacket::decode(&b);
+                    on_pen_packet(&mut injector, &pkt, &mut last_seq, gamma, desk_w, desk_h);
+                }
+            }
+            Ok(Some((CH_HEARTBEAT, payload))) => {
+                if let Some(ts) = decode_heartbeat(&payload) {
+                    if pending_hb == Some(ts) {
+                        let rtt = monotonic_us().saturating_sub(ts);
+                        RTT_MS.store((rtt / 1000).min(65535) as u16, Ordering::Relaxed);
+                        last_hb_echo = Instant::now();
+                        pending_hb = None;
+                    } else {
+                        // Heartbeat dari HP — echo kembali.
+                        let _ = link.write_frame(CH_HEARTBEAT, &encode_heartbeat(ts));
+                    }
+                }
+            }
+            Ok(Some((_ch, _))) => {
+                // CH_VIDEO tak diharapkan dari HP; lainnya diabaikan.
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("baca USB gagal: {e}");
+                return;
+            }
+        }
     }
+}
+
+/// Baca satu frame dengan deadline total.
+fn read_frame_deadline(
+    link: &mut usb::UsbLink,
+    deadline: Duration,
+) -> Result<(u8, Vec<u8>), usb::UsbError> {
+    let start = Instant::now();
+    loop {
+        match link.poll_frame(Duration::from_millis(200))? {
+            Some(f) => return Ok(f),
+            None => {
+                if start.elapsed() > deadline {
+                    return Err(usb::UsbError::Timeout("handshake"));
+                }
+            }
+        }
+    }
+}
+
+fn on_pen_packet<I: Injector>(
+    injector: &mut I,
+    p: &PenPacket,
+    last_seq: &mut Option<u16>,
+    gamma: f32,
+    desk_w: i32,
+    desk_h: i32,
+) {
+    if let Some(prev) = *last_seq {
+        let gap = p.seq_gap(prev);
+        if gap > 0 {
+            eprintln!("peringatan: {gap} paket input hilang");
+        }
+    }
+    *last_seq = Some(p.seq);
+
+    // x/y sudah dinormalisasi terhadap desktop penuh oleh HP.
+    let x = (p.x.clamp(0.0, 1.0) * desk_w as f32).round() as i32;
+    let y = (p.y.clamp(0.0, 1.0) * desk_h as f32).round() as i32;
+    let contact = match p.kind {
+        KIND_DOWN | KIND_MOVE => true,
+        KIND_UP | KIND_HOVER => false,
+        _ => return,
+    };
+    injector.pen(&PenReport {
+        x: x.clamp(0, desk_w - 1),
+        y: y.clamp(0, desk_h - 1),
+        pressure01: p.pressure.clamp(0.0, 1.0).powf(gamma),
+        tilt_x: p.tilt_x as i32,
+        tilt_y: p.tilt_y as i32,
+        in_range: true,
+        contact,
+        barrel: p.flags & gpad_protocol::FLAG_BARREL_BUTTON != 0,
+        eraser: p.flags & gpad_protocol::FLAG_ERASER != 0,
+    });
+}
+
+#[cfg(windows)]
+fn desktop_size() -> (i32, i32) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
+}
+
+fn monotonic_us() -> u64 {
+    use std::sync::OnceLock;
+    static T0: OnceLock<Instant> = OnceLock::new();
+    let t0 = T0.get_or_init(Instant::now);
+    t0.elapsed().as_micros() as u64
+}
+
+// Re-ekspor untuk tray.
+pub(crate) fn status_snapshot() -> (u8, u8, u16) {
+    (
+        STATUS.load(Ordering::Relaxed),
+        FPS_OUT.load(Ordering::Relaxed),
+        RTT_MS.load(Ordering::Relaxed),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpad_protocol::{decode_mode_reply, CAP_HOVER, CAP_PRESSURE, MODE_REPLY_LEN};
+    use gpad_protocol::FLAG_FINGER;
 
     fn pkt(kind: u8, seq: u16, x: f32, y: f32) -> PenPacket {
         PenPacket {
             kind,
-            flags: 0,
+            flags: FLAG_FINGER,
             seq,
             t_us: 0,
             x,
             y,
-            pressure: 0.5,
+            pressure: 0.65,
             tilt_x: 0,
             tilt_y: 0,
         }
     }
 
-    fn app() -> App<MockInjector> {
-        MODE.store(MODE_ABSOLUTE, Ordering::Relaxed);
-        // Aspek HP 16:9 sama dengan area -> keep_aspect tidak mengubah apa-apa.
-        App::new(MockInjector::with_screen(1920, 1080), Config::default(), 16.0 / 9.0, None)
-    }
-
     #[test]
-    fn packet_drives_pen_absolute() {
-        let mut app = app();
-        let reports = app.injector.reports.clone();
-        app.on_packet(&pkt(KIND_DOWN, 1, 0.0, 0.0));
-        app.on_packet(&pkt(KIND_MOVE, 2, 0.5, 0.5));
-        app.on_packet(&pkt(KIND_HOVER, 3, 0.75, 0.75));
-        app.on_packet(&pkt(KIND_UP, 4, 1.0, 1.0));
-        let rs = reports.lock().unwrap();
-        assert_eq!(rs.len(), 4);
-        assert_eq!((rs[0].x, rs[0].y), (0, 0));
-        assert!(rs[0].contact && rs[0].in_range);
-        assert_eq!((rs[1].x, rs[1].y), (960, 540));
-        assert!(rs[1].contact);
-        assert!(!rs[2].contact && rs[2].in_range);
-        assert!(!rs[3].contact);
-        assert!((rs[1].pressure01 - 0.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn mode_switch_packet_changes_mode() {
-        let mut app = app();
-        assert_eq!(MODE.load(Ordering::Relaxed), MODE_ABSOLUTE);
-        let mut p = pkt(KIND_MODE_SWITCH, 1, 0.0, 0.0);
-        p.flags = 1; // -> relatif
-        app.on_packet(&p);
-        assert_eq!(MODE.load(Ordering::Relaxed), MODE_RELATIVE);
-        // paket gerak berikutnya memakai mode relatif (tidak lompat)
-        let reports = app.injector.reports.clone();
-        app.on_packet(&pkt(KIND_DOWN, 2, 0.5, 0.5));
-        app.on_packet(&pkt(KIND_MOVE, 3, 0.6, 0.5));
-        let rs = reports.lock().unwrap();
-        // mulai dari tengah layar (960,540), geser 0.1*1920 = +192
+    fn pen_packet_maps_to_desktop_pixels() {
+        let mut inj = MockInjector::with_screen(1920, 1080);
+        let mut last = None;
+        on_pen_packet(&mut inj, &pkt(KIND_DOWN, 1, 0.5, 0.5), &mut last, 1.0, 1920, 1080);
+        let rs = inj.take_reports();
+        assert_eq!(rs.len(), 1);
         assert_eq!((rs[0].x, rs[0].y), (960, 540));
-        assert_eq!((rs[1].x, rs[1].y), (1152, 540));
-        MODE.store(MODE_ABSOLUTE, Ordering::Relaxed); // bersih-bersih
+        assert!(rs[0].contact);
+        assert!((rs[0].pressure01 - 0.65).abs() < 1e-6);
     }
 
     #[test]
-    fn decode_mode_reply_ok() {
-        assert_eq!(decode_mode_reply(&encode_mode_reply(MODE_RELATIVE)), Some(MODE_RELATIVE));
-        assert_eq!(decode_mode_reply(&[0u8; MODE_REPLY_LEN]), None);
+    fn pen_packet_clamps_edges() {
+        let mut inj = MockInjector::with_screen(1920, 1080);
+        let mut last = None;
+        on_pen_packet(&mut inj, &pkt(KIND_DOWN, 1, 1.5, -0.5), &mut last, 1.0, 1920, 1080);
+        let rs = inj.take_reports();
+        assert_eq!((rs[0].x, rs[0].y), (1919, 0));
     }
 
     #[test]
-    fn handshake_caps_survive() {
-        let h = Handshake {
-            version: PROTOCOL_VERSION,
-            caps: CAP_PRESSURE | CAP_HOVER,
-            width: 1080,
-            height: 2400,
-        };
-        let decoded = Handshake::decode(&h.encode()).unwrap();
-        assert_eq!(decoded.caps, CAP_PRESSURE | CAP_HOVER);
+    fn hover_has_no_contact() {
+        let mut inj = MockInjector::with_screen(1920, 1080);
+        let mut last = None;
+        on_pen_packet(&mut inj, &pkt(KIND_HOVER, 1, 0.1, 0.1), &mut last, 1.0, 1920, 1080);
+        let rs = inj.take_reports();
+        assert!(!rs[0].contact);
+        assert!(rs[0].in_range);
+    }
+
+    #[test]
+    fn heartbeat_encode_decode_for_rtt() {
+        let ts = monotonic_us();
+        let b = encode_heartbeat(ts);
+        assert_eq!(decode_heartbeat(&b), Some(ts));
+    }
+
+    #[test]
+    fn reconnect_delay_increases() {
+        use std::time::Duration;
+        assert_eq!(gpad_protocol::reconnect_delay(0), Duration::from_secs(1));
+        assert_eq!(gpad_protocol::reconnect_delay(3), Duration::from_secs(8));
     }
 }

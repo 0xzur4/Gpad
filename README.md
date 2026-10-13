@@ -1,98 +1,96 @@
-# Gpad — HP jadi pen tablet via USB (Fase 1)
+# Gpad — Turn Your Phone into a Pen Display over USB
 
-Mengubah ponsel/tablet Android menjadi alas gambar untuk PC Windows,
-terhubung lewat kabel USB agar jeda sekecil mungkin.
+Turn an Android phone/tablet into a pen display for a Windows PC.
+The PC screen is mirrored to the phone over a USB cable for minimal latency;
+you draw on the phone while seeing the screen, and the PC shows it too.
 
-## Status: Fase 4 (ukur & perkecil jeda)
+## Status: v0.5.0 "Cintiq mode" (built, needs hardware testing)
 
-- [x] Fase 1–3 selesai (lihat di bawah).
-- [x] Fase 4 — perbaikan nyata:
-  - Android: thread jaringan prioritas `THREAD_PRIORITY_URGENT_DISPLAY`;
-    jalur panas TANPA alokasi (pool array 24-byte + encode manual LE,
-    tanpa `ByteBuffer` per titik, tanpa tekanan GC); tulis TCP per batch
-    (1 flush untuk ≤16 paket, bukan 1 flush per paket).
-  - Daemon: pembacaan blokir TANPA timeout (tanpa bangun palsu);
-    thread bernama (`gpad-hotkey`, `gpad-tray`, `gpad-profiles`);
-    statistik latensi proses per paket tiap 2000 paket (avg/p95/maks).
-- [x] Angka terukur (jujur, bukan tebakan) — komponen "proses daemon",
-      10.000 paket, VM Linux + mock injector:
-      **avg <1µs, p95 <1µs, maks 42–91µs**.
-      Ini BUKAN angka Windows/injeksi nyata — angka itu hanya bisa diukur
-      di hardware zura (lihat metode di bawah).
-- [ ] Pengukuran end-to-end di hardware asli (metode kamera 240fps):
-      rekam sentuh stylus → garis muncul di Krita; hitung frame di antaranya
-      (1 frame ≈ 4.2ms). Pisahkan komponen: sentuh Android (bandingkan
-      `t_us` paket vs waktu tulis di log debug), jaringan USB (dominan kecil),
-      proses daemon (statistik di atas, di Windows mencakup
-      `InjectSyntheticPointerInput`), render aplikasi (sisa dari total kamera).
+v0.5.0 replaces the previous blind-tablet approach (v0.4.x, ADB reverse
+transport) with a pen-display architecture:
 
-## Status: Fase 3 (kenyamanan pakai)
+- **Transport: USB Accessory Mode (AOA)** — no ADB, no platform-tools,
+  no `adb reverse`. Plug the cable, tap one "Connect" button.
+  Length-prefixed packets over USB bulk endpoints, heartbeat every second,
+  auto-reconnect with backoff. Protocol spec: `docs/protocol-v05.md`.
+- **Video downstream**: Windows DXGI desktop duplication → scaled to ≤1080p →
+  H.264 encode (OpenH264, statically linked — no DLL to bundle) → USB →
+  Android MediaCodec hardware decode → displayed on the phone.
+  Target 30 fps at ~3 Mbps.
+- **Input upstream**: touch on the phone → mapped from the displayed video
+  rect to absolute PC desktop coordinates → injected as pen input
+  (Windows Ink synthetic pointer device, reused from v0.4.x).
+- Mirrors the full primary display (letterboxed on the phone).
+- PC daemon: tray icon with status / fps / RTT; `--console` flag for
+  diagnostics; runs without a console window by default.
+- Android app: single "Hubungkan" button, status line (connecting /
+  connected / fps / RTT), full-screen landscape video.
 
-- [x] Fase 1–2: protokol, daemon pen injection Windows Ink, aplikasi Android.
-- [x] Fase 3:
-  - Mode absolut (area: `screen` | `monitor:N` | `custom`, opsi `keep_aspect`)
-    dan mode relatif (sensitivitas, tanpa akselerasi, reset acuan saat angkat).
-  - Ganti mode 4 cara: tombol di HP, tombol barrel stylus, hotkey global
-    (`ctrl+alt+g`, bisa diubah/dimatikan), menu tray. Daemon membalas paket
-    `GMOD` agar indikator mode di HP selalu sinkron.
-  - System tray Windows (ikon + tooltip + menu mode/keluar).
-  - `gpad.toml`: semua pengaturan + profil per aplikasi (mis. Photoshop
-    otomatis absolut, Krita sensitivitas 1.2). Lihat `gpad.example.toml`.
-  - Kurva tekanan pindah ke config (env `GPAD_PRESSURE_GAMMA` tetap menimpa).
-  - Diagnostik ADB: deteksi kabel charge-only vs perangkat belum dipercaya.
-- [x] Verifikasi: 14 test lolos; target `x86_64-pc-windows-gnu` compile bersih
-      tanpa warning (semua modul); smoke test socket: handshake, hover/down/
-      move/up, ganti mode via paket + balasan GMOD dua arah.
-- [ ] Uji di hardware asli (Windows + A56): bangun `.exe` (`cargo build --release`),
-      bangun APK di Android Studio, `adb reverse`, uji di Krita.
+Expected glass-to-glass latency: ~50–150 ms (honest estimate from the
+component budget: capture + encode + USB + decode; real measurement
+requires the hardware setup).
 
-## Batasan hardware jujur (Samsung A56)
+Built and unit-tested on 2026-10-13 (27 Rust tests pass, APK compiles and
+is signed). Not yet tested end-to-end on real hardware — the AOA USB
+handshake, the WinUSB/Zadig step, and the MediaCodec pipeline all need a
+real PC + phone run.
 
-A56 **tidak punya stylus aktif** (S Pen). Artinya di Fase 1–2:
-- x/y/hover-jari: BISA diuji penuh.
-- pressure: Android memberi nilai tekanan jari (bervariasi, tidak presisi).
-- tilt presisi & tombol barrel: TIDAK bisa diuji — field protokolnya sudah
-  ada, tapi validasi perilaku nyata butuh perangkat ber-stylus.
+## Honest hardware limitations (Samsung A56)
 
-## Cara build
+The A56 has **no active stylus** (no S Pen). That means:
 
-### Daemon (di PC Windows)
+- x/y finger position: fully testable.
+- pressure: the app sends a **constant emulated pressure of 0.65** for
+  finger touches (Android finger pressure is too noisy to use directly);
+  the daemon's `[pressure] gamma` config curve still applies.
+- precise tilt & barrel button: protocol fields exist, but real behavior
+  needs stylus hardware.
+
+## Building
+
+### Daemon (on the Windows PC)
 
 ```powershell
-# butuh Rust: https://rustup.rs/
+# needs Rust: https://rustup.rs/
 cd gpad
 cargo build --release
 # -> target\release\gpad-daemon.exe
 ```
 
-### Aplikasi Android (di PC, pakai Android Studio)
+### Android app (on a PC with Android Studio)
 
-1. Buka folder `gpad/android` di Android Studio.
-2. Biarkan Gradle sync (butuh internet sekali).
-3. Run ▶ ke HP (atau Build > Build APK).
+1. Open the `gpad/android` folder in Android Studio.
+2. Let Gradle sync (needs internet once).
+3. Run ▶ to the phone (or Build > Build APK).
 
-## Cara pakai (Fase 1)
+(The v0.5.0 APK was also built successfully with plain SDK command-line
+tools — aapt2 + kotlinc + d8 + apksigner — so Android Studio is
+convenient but not required.)
 
-1. Di PC: jalankan `gpad-daemon.exe`.
-2. Colok HP dengan **kabel DATA** (bukan kabel charge-only).
-3. Aktifkan USB debugging di HP, izinkan PC.
-4. Di PC: `adb reverse tcp:51337 tcp:51337`
-   (daemon juga mencoba otomatis saat start).
-5. Buka aplikasi Gpad di HP — status "Tersambung".
-6. Sentuh/geser di HP → kursor PC mengikuti (mode absolut seluruh layar).
+## Usage (v0.5.0)
+
+1. On the PC: run `gpad-daemon.exe`.
+2. Connect the phone with a **data cable** (not charge-only).
+3. One-time: install the WinUSB driver for the phone via Zadig
+   (see `docs/driver-setup.md`).
+4. Open the Gpad app on the phone, tap **Connect**.
+5. The PC screen appears on the phone; touch/drag draws on the PC.
 
 ## Troubleshooting
 
-| Gejala | Penyebab umum |
+| Symptom | Common cause |
 |---|---|
-| Status "PC tidak terjangkau" | Kabel charge-only; USB debugging mati; `adb reverse` belum jalan; daemon belum start |
-| Kursor tidak gerak tapi tersambung | Cek log daemon di terminal |
-| Garis patah-patah | Titik historis tidak terkirim (cek log); naikkan prioritas thread di HP |
+| "PC unreachable" | Charge-only cable; WinUSB driver not installed; daemon not running |
+| Connected but cursor doesn't move | Check the daemon log (run with `--console`) |
+| Choppy lines | Touch batching issue (check app log); USB contention |
 
-## Peta jalan
+## Roadmap
 
-- **Fase 2**: tekanan & tilt → suntik sebagai input pena Windows Ink
-  (CreateSyntheticPointerDevice), uji ketebalan garis di Krita.
-- **Fase 3**: area terpilih, mode relatif, kurva tekanan, tray, profil.
-- **Fase 4**: ukur jeda dengan kamera high-speed, bandingkan vs Weylus.
-- **Fase 5**: macOS/Linux, iOS via usbmuxd, installer.
+- **v0.5.0**: Cintiq mode (this release) — AOA transport, H.264 mirror,
+  touch-to-pen, one-button connect.
+- **v0.5.1**: per-window/region mirror selection, pressure curve tuning.
+- **v0.6**: macOS/Linux daemon, iOS via usbmuxd, installer.
+
+## History
+
+- v0.4.x: blind-tablet mode over `adb reverse` TCP (superseded).

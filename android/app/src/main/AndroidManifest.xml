@@ -1,24 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.gpad.app"
-    android:versionCode="4"
-    android:versionName="0.4.0">
+    package="com.gpad.app">
 
-    <!-- Dibutuhkan bahkan untuk socket localhost -->
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- AOA: HP jadi USB accessory -->
+    <uses-feature android:name="android.hardware.usb.accessory" />
 
     <application
         android:label="Gpad"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar.Fullscreen"
+        android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen"
         android:supportsRtl="true">
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:screenOrientation="landscape">
+            android:screenOrientation="landscape"
+            android:launchMode="singleTask">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Auto-buka saat PC masuk mode accessory -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"
+                android:resource="@xml/accessory_filter" />
         </activity>
     </application>
 </manifest>
