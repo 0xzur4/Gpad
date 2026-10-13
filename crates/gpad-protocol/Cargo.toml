@@ -1,0 +1,6 @@
+[package]
+name = "gpad-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Protokol biner Gpad: definisi paket pena bersama PC dan Android"
+license = "MIT"

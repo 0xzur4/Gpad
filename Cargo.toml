@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/gpad-protocol", "crates/gpad-daemon"]
+resolver = "2"
