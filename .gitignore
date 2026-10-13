@@ -1,0 +1,14 @@
+# Rust
+target/
+# Android
+android/app/build/
+android/build/
+android/.gradle/
+*.apk
+# Windows
+*.exe
+*.dll
+# Editor
+.idea/
+.vscode/
+*.iml
